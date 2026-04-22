@@ -2,6 +2,8 @@
 
 A production-grade data engineering pipeline on **Google Cloud Platform** that processes flight booking data using **Apache Airflow (Cloud Composer)**, **Dataproc Serverless (PySpark)**, and **BigQuery**. The entire CI/CD workflow is automated via **GitHub Actions** with **Workload Identity Federation (WIF)** for secure, keyless authentication.
 
+> 📌 **Note:** All GCP infrastructure for this project was set up using the **Google Cloud Console (UI)** — no command-line tools required. Instructions below reflect the UI-based workflow.
+
 ---
 
 ## 📋 Table of Contents
@@ -12,7 +14,7 @@ A production-grade data engineering pipeline on **Google Cloud Platform** that p
 - [Pipeline Workflow](#-pipeline-workflow)
 - [Data Transformations](#-data-transformations)
 - [Prerequisites](#-prerequisites)
-- [GCP Setup](#-gcp-setup)
+- [GCP Setup (via Console)](#-gcp-setup-via-console)
 - [GitHub Setup](#-github-setup)
 - [Deployment](#-deployment)
 - [Environments](#-environments)
@@ -162,7 +164,7 @@ Before getting started, make sure you have:
 - A **GCP Project** with billing enabled
 - **Owner** or **IAM Admin** role on the project
 - A **GitHub repository** (this one!)
-- The following **GCP APIs enabled**:
+- The following **GCP APIs enabled** (via `APIs & Services → Library`):
   - Cloud Composer API
   - Dataproc API
   - BigQuery API
@@ -172,140 +174,179 @@ Before getting started, make sure you have:
 
 ---
 
-## ☁️ GCP Setup
+## ☁️ GCP Setup (via Console)
+
+All infrastructure was provisioned through the **Google Cloud Console (UI)**. Follow these steps in order.
 
 ### Step 1: Create GCS Buckets
 
-```bash
-# Data bucket (input CSV + Spark job code)
-gsutil mb -l us-central1 gs://aiflow-sample-project-dev/
+1. Navigate to **Cloud Storage → Buckets**
+2. Click **+ CREATE**
+3. Create the following bucket:
 
-# Create folder structure
-gsutil cp /dev/null gs://aiflow-sample-project-dev/flight-booking-analysis/source-dev/
-gsutil cp /dev/null gs://aiflow-sample-project-dev/flight-booking-analysis/source-prod/
-gsutil cp /dev/null gs://aiflow-sample-project-dev/flight-booking-analysis/spark-job/
-```
+| Bucket Name | Location | Storage Class |
+|---|---|---|
+| `aiflow-sample-project-dev` | `us-central1` | Standard |
+
+4. Inside the bucket, create the following folder structure using **CREATE FOLDER**:
+   ```
+   flight-booking-analysis/
+   ├── source-dev/
+   ├── source-prod/
+   └── spark-job/
+   ```
 
 ### Step 2: Create BigQuery Datasets
 
-```bash
-bq mk --location=us-central1 flight_data_dev
-bq mk --location=us-central1 flight_data_prod
-```
+1. Navigate to **BigQuery → SQL Workspace**
+2. In the Explorer panel, click on your project → **⋮ (three dots)** → **Create dataset**
+3. Create two datasets:
+
+| Dataset ID | Location |
+|---|---|
+| `flight_data_dev` | `us-central1` |
+| `flight_data_prod` | `us-central1` |
+
+> **Note:** Tables will be auto-created by the Spark job, so you don't need to create them manually.
 
 ### Step 3: Create Cloud Composer Environments
 
-Create two environments:
-- `airflow-dev` (for development)
-- `airflow-prod` (for production)
+1. Navigate to **Composer → Environments**
+2. Click **+ CREATE ENVIRONMENT → Composer 2**
+3. Create two environments:
 
-```bash
-gcloud composer environments create airflow-dev \
-  --location=us-central1 \
-  --image-version=composer-2-airflow-2
+| Environment Name | Location | Image Version |
+|---|---|---|
+| `airflow-dev` | `us-central1` | `composer-2-airflow-2` |
+| `airflow-prod` | `us-central1` | `composer-2-airflow-2` |
 
-gcloud composer environments create airflow-prod \
-  --location=us-central1 \
-  --image-version=composer-2-airflow-2
-```
+> ⏳ **Heads up:** Composer environments take 20-25 minutes to provision.
 
 ### Step 4: Create Service Accounts
 
-```bash
-PROJECT_ID="project-03803ccd-8fd5-4d10-a60"
+Navigate to **IAM & Admin → Service Accounts** and click **+ CREATE SERVICE ACCOUNT** for each:
 
-# GitHub Actions deployment SA (per environment)
-gcloud iam service-accounts create github-actions-sa-dev \
-  --display-name="GitHub Actions Dev SA"
+| Service Account Name | Purpose |
+|---|---|
+| `github-actions-sa-dev` | GitHub Actions deployment (dev) |
+| `github-actions-sa-prod` | GitHub Actions deployment (prod) |
+| `dataproc-runtime-sa` | Dataproc Serverless runtime |
 
-gcloud iam service-accounts create github-actions-sa-prod \
-  --display-name="GitHub Actions Prod SA"
-
-# Dedicated Dataproc runtime SA
-gcloud iam service-accounts create dataproc-runtime-sa \
-  --display-name="Dataproc Serverless Runtime SA"
-```
+For each, fill in:
+- **Service account name:** (as above)
+- **Service account ID:** (auto-filled)
+- **Description:** (optional)
+- Click **CREATE AND CONTINUE**
+- Skip role assignment here (we'll do it in Step 5)
+- Click **DONE**
 
 ### Step 5: Grant IAM Roles
 
-**For GitHub Actions Service Accounts:**
-```bash
-for env in dev prod; do
-  SA="github-actions-sa-${env}@${PROJECT_ID}.iam.gserviceaccount.com"
+Navigate to **IAM & Admin → IAM** and click **+ GRANT ACCESS** for each service account.
 
-  gcloud projects add-iam-policy-binding $PROJECT_ID \
-    --member="serviceAccount:${SA}" \
-    --role="roles/composer.user"
+#### For `github-actions-sa-dev` and `github-actions-sa-prod`:
 
-  gcloud projects add-iam-policy-binding $PROJECT_ID \
-    --member="serviceAccount:${SA}" \
-    --role="roles/storage.objectAdmin"
+| Role | Purpose |
+|---|---|
+| `Composer User` | Interact with Cloud Composer |
+| `Storage Object Admin` | Upload files to GCS |
+| `Service Account User` | Required for impersonation |
 
-  gcloud projects add-iam-policy-binding $PROJECT_ID \
-    --member="serviceAccount:${SA}" \
-    --role="roles/iam.serviceAccountUser"
-done
+#### For `dataproc-runtime-sa`:
+
+| Role | Purpose |
+|---|---|
+| `Dataproc Worker` | Run Spark jobs |
+| `Storage Object Admin` | Read from & write to GCS |
+| `BigQuery Data Editor` | Write to BigQuery tables |
+| `BigQuery Job User` | Run BigQuery jobs |
+
+### Step 6: Grant Composer SA Permission to Impersonate Dataproc SA
+
+This is **critical** — without it, the Dataproc job will fail with a "not authorized to act as service account" error.
+
+1. Go to **IAM & Admin → Service Accounts**
+2. Click on **`dataproc-runtime-sa`**
+3. Click the **PERMISSIONS** tab
+4. Click **+ GRANT ACCESS**
+5. In **New principals**, enter the Composer environment's service account:
+   ```
+   56749168976-compute@developer.gserviceaccount.com
+   ```
+6. In **Role**, select **`Service Account User`**
+7. Click **SAVE**
+
+### Step 7: Set Up Workload Identity Federation
+
+#### 7a. Create the Workload Identity Pool
+
+1. Navigate to **IAM & Admin → Workload Identity Federation**
+2. Click **+ CREATE POOL**
+3. Fill in:
+   - **Name:** `github-pool`
+   - **Pool ID:** `github-pool` (auto-filled)
+   - **Description:** `Pool for GitHub Actions authentication`
+   - **Enabled pool:** ✅ ON
+4. Click **CONTINUE**
+
+#### 7b. Add an OIDC Provider
+
+On the "Add a provider to pool" screen:
+
+1. Select provider type: **OpenID Connect (OIDC)**
+2. Fill in:
+   - **Provider name:** `github-provider`
+   - **Provider ID:** `github-provider` (auto-filled)
+   - **Issuer URL:** `https://token.actions.githubusercontent.com`
+   - **Audiences:** Select **Default audience**
+3. Click **CONTINUE**
+
+#### 7c. Configure Provider Attributes
+
+Under **Configure provider attributes**, add the following mappings:
+
+| Google Attribute | OIDC Claim |
+|---|---|
+| `google.subject` | `assertion.sub` |
+| `attribute.actor` | `assertion.actor` |
+| `attribute.repository` | `assertion.repository` |
+| `attribute.repository_owner` | `assertion.repository_owner` |
+| `attribute.ref` | `assertion.ref` |
+
+Under **Attribute Conditions (CEL)**, add this expression to restrict access to your GitHub org:
+```
+assertion.repository_owner == 'YOUR_GITHUB_ORG'
 ```
 
-**For Dataproc Runtime Service Account:**
-```bash
-DATAPROC_SA="dataproc-runtime-sa@${PROJECT_ID}.iam.gserviceaccount.com"
+Click **SAVE**.
 
-gcloud projects add-iam-policy-binding $PROJECT_ID \
-  --member="serviceAccount:${DATAPROC_SA}" \
-  --role="roles/dataproc.worker"
+#### 7d. Grant Access to Service Accounts
 
-gcloud projects add-iam-policy-binding $PROJECT_ID \
-  --member="serviceAccount:${DATAPROC_SA}" \
-  --role="roles/storage.objectAdmin"
+After the pool is created:
 
-gcloud projects add-iam-policy-binding $PROJECT_ID \
-  --member="serviceAccount:${DATAPROC_SA}" \
-  --role="roles/bigquery.dataEditor"
+1. Click on the **`github-pool`** pool
+2. Click **GRANT ACCESS** at the top
+3. Select: **Grant access using service account impersonation**
+4. In **Service account**, select: `github-actions-sa-dev@...`
+5. In **Select principals**:
+   - **Principal type:** `repository`
+   - **Attribute value:** `YOUR_ORG/YOUR_REPO`
+6. Click **SAVE**
+7. On the download config dialog, click **DISMISS**
 
-gcloud projects add-iam-policy-binding $PROJECT_ID \
-  --member="serviceAccount:${DATAPROC_SA}" \
-  --role="roles/bigquery.jobUser"
-```
+Repeat the above for `github-actions-sa-prod`.
 
-**Allow Composer SA to impersonate Dataproc SA:**
-```bash
-COMPOSER_SA="56749168976-compute@developer.gserviceaccount.com"
+#### 7e. Get the Provider Resource Name
 
-gcloud iam service-accounts add-iam-policy-binding $DATAPROC_SA \
-  --member="serviceAccount:${COMPOSER_SA}" \
-  --role="roles/iam.serviceAccountUser"
-```
+1. Inside `github-pool`, click on **`github-provider`**
+2. At the top of the page, copy the **full resource name** shown next to **IAM Principal**:
+   ```
+   projects/PROJECT_NUMBER/locations/global/workloadIdentityPools/github-pool/providers/github-provider
+   ```
 
-### Step 6: Set Up Workload Identity Federation
+   > 💡 **Tip:** To find your **PROJECT_NUMBER**, go to **IAM & Admin → Settings** — the project number is displayed at the top (numeric, not the alphanumeric ID).
 
-```bash
-# Create Workload Identity Pool
-gcloud iam workload-identity-pools create "github-pool" \
-  --project="${PROJECT_ID}" \
-  --location="global" \
-  --display-name="GitHub Actions Pool"
-
-# Create OIDC Provider
-gcloud iam workload-identity-pools providers create-oidc "github-provider" \
-  --project="${PROJECT_ID}" \
-  --location="global" \
-  --workload-identity-pool="github-pool" \
-  --display-name="GitHub OIDC Provider" \
-  --issuer-uri="https://token.actions.githubusercontent.com" \
-  --attribute-mapping="google.subject=assertion.sub,attribute.actor=assertion.actor,attribute.repository=assertion.repository,attribute.repository_owner=assertion.repository_owner,attribute.ref=assertion.ref" \
-  --attribute-condition="assertion.repository_owner == 'YOUR_GITHUB_ORG'"
-
-# Link GitHub repo to SAs
-PROJECT_NUMBER=$(gcloud projects describe ${PROJECT_ID} --format="value(projectNumber)")
-
-for env in dev prod; do
-  gcloud iam service-accounts add-iam-policy-binding \
-    "github-actions-sa-${env}@${PROJECT_ID}.iam.gserviceaccount.com" \
-    --role="roles/iam.workloadIdentityUser" \
-    --member="principalSet://iam.googleapis.com/projects/${PROJECT_NUMBER}/locations/global/workloadIdentityPools/github-pool/attribute.repository/YOUR_ORG/YOUR_REPO"
-done
-```
+You'll need this value for the GitHub repository setup.
 
 ---
 
@@ -313,19 +354,22 @@ done
 
 ### Add Repository Variables
 
-Go to **Settings → Secrets and variables → Actions → Variables** and add:
+Go to your GitHub repo → **Settings → Secrets and variables → Actions → Variables tab** → **New repository variable**.
+
+Add the following variables:
 
 | Variable Name | Value |
 |---|---|
 | `GCP_PROJECT_ID` | `project-03803ccd-8fd5-4d10-a60` |
 | `GCP_WIF_PROVIDER` | `projects/PROJECT_NUMBER/locations/global/workloadIdentityPools/github-pool/providers/github-provider` |
-| `GCP_SERVICE_ACCOUNT_DEV` | `github-actions-sa-dev@PROJECT.iam.gserviceaccount.com` |
-| `GCP_SERVICE_ACCOUNT_PROD` | `github-actions-sa-prod@PROJECT.iam.gserviceaccount.com` |
+| `GCP_SERVICE_ACCOUNT_DEV` | `github-actions-sa-dev@project-03803ccd-8fd5-4d10-a60.iam.gserviceaccount.com` |
+| `GCP_SERVICE_ACCOUNT_PROD` | `github-actions-sa-prod@project-03803ccd-8fd5-4d10-a60.iam.gserviceaccount.com` |
 
-### Create GitHub Environment for Production (Optional but Recommended)
+### Create GitHub Environment for Production (Recommended)
 
-1. **Settings → Environments → New Environment → `production`**
-2. Enable **Required reviewers** to enforce manual approval before prod deploys
+1. Go to **Settings → Environments → New environment**
+2. Name it `production`
+3. Enable **Required reviewers** to enforce manual approval before production deploys
 
 ---
 
@@ -333,7 +377,7 @@ Go to **Settings → Secrets and variables → Actions → Variables** and add:
 
 ### Automatic Deployment (GitHub Actions)
 
-Simply push to the appropriate branch:
+The pipeline automatically deploys when you push to either branch:
 
 ```bash
 # Deploy to dev
@@ -348,15 +392,16 @@ git merge dev
 git push origin main
 ```
 
-The CI/CD pipeline will automatically:
-1. Authenticate to GCP via WIF
-2. Upload the Spark job to GCS
-3. Deploy the DAG to Composer
-4. Import Airflow variables
+The CI/CD pipeline will:
+1. Authenticate to GCP via WIF (keyless!)
+2. Upload `variables.json` to the Composer GCS bucket
+3. Import variables into Airflow
+4. Upload the Spark job to GCS
+5. Deploy the DAG to Cloud Composer
 
 ### Manual Deployment
 
-If needed, you can manually deploy by running the workflow from the **Actions** tab → **Flight Booking CICD** → **Run workflow**.
+You can also trigger the workflow manually from the **Actions tab → Flight Booking CICD → Run workflow**.
 
 ---
 
@@ -371,22 +416,28 @@ If needed, you can manually deploy by running the workflow from the **Actions** 
 
 ## ▶️ Running the Pipeline
 
-### 1. Upload Input Data
-Place the `flight_booking.csv` file in the expected GCS location:
-```bash
-gsutil cp data/flight_booking.csv \
-  gs://aiflow-sample-project-dev/flight-booking-analysis/source-dev/
-```
+### 1. Upload Input Data to GCS
+
+Via the **GCP Console**:
+1. Go to **Cloud Storage → Buckets → `aiflow-sample-project-dev`**
+2. Navigate to `flight-booking-analysis/source-dev/`
+3. Click **UPLOAD FILES** and upload `flight_booking.csv`
 
 ### 2. Trigger the DAG
-Go to the **Airflow UI** (via Composer) → **DAGs** → `flight_booking_dataproc_bq_dag` → **Trigger DAG**.
+
+1. Open the **Airflow UI** from **Composer → Environments → airflow-dev → Airflow webserver link**
+2. Find the DAG: `flight_booking_dataproc_bq_dag`
+3. Toggle it **ON** if not already
+4. Click the **▶ Play** button → **Trigger DAG**
 
 ### 3. Monitor Execution
-- **File Sensor task** — waits for CSV (up to 5 min timeout)
+
+- **File Sensor task** — waits for the CSV (up to 5 min timeout)
 - **Dataproc task** — submits Spark batch, typically completes in 3-5 minutes
 
-### 4. Verify Output
-Check BigQuery:
+### 4. Verify Output in BigQuery
+
+Go to **BigQuery → SQL Workspace** and run:
 ```sql
 SELECT * FROM `project-03803ccd-8fd5-4d10-a60.flight_data_dev.transformed_table` LIMIT 10;
 SELECT * FROM `project-03803ccd-8fd5-4d10-a60.flight_data_dev.route_insights` LIMIT 10;
@@ -398,23 +449,28 @@ SELECT * FROM `project-03803ccd-8fd5-4d10-a60.flight_data_dev.origin_insights` L
 ## 🔍 Monitoring & Troubleshooting
 
 ### Airflow UI
-- **URL:** Available through the Cloud Composer console
-- **Logs:** Click any task → **Logs** tab
+- **Access:** Composer → Environments → `airflow-dev` → **Airflow webserver link**
+- **Logs:** Click any task in the DAG → **Logs** tab
 
 ### Dataproc Serverless
 - **Console:** Dataproc → Serverless → Batches
 - **Spark UI:** Available for 30 days after job completion
-- **Logs:** Cloud Logging (integrated with the console)
+- **Logs:** Automatically integrated with Cloud Logging
+
+### Cloud Logging
+- **Access:** Navigate to **Logging → Logs Explorer**
+- Filter by resource type or service for targeted debugging
 
 ### Common Issues
 
 | Error | Cause | Fix |
 |---|---|---|
-| `User not authorized to act as service account` | Missing `iam.serviceAccountUser` role | Grant the Composer SA `Service Account User` role on the Dataproc SA |
+| `User not authorized to act as service account` | Missing `iam.serviceAccountUser` role | Grant the Composer SA `Service Account User` role on the Dataproc SA (Step 6) |
 | `File not found in GCS bucket` | CSV not uploaded | Upload `flight_booking.csv` to the correct bucket path |
-| `Permission denied on BigQuery dataset` | Dataproc SA missing BQ roles | Grant `bigquery.dataEditor` and `bigquery.jobUser` |
-| `WIF token validation failed` | Attribute condition mismatch | Check the org/repo in the WIF provider condition |
-| `Composer environment not found` | Wrong env name or location | Verify with `gcloud composer environments list` |
+| `Permission denied on BigQuery dataset` | Dataproc SA missing BQ roles | Grant `BigQuery Data Editor` and `BigQuery Job User` via IAM |
+| `WIF token validation failed` | Attribute condition mismatch | Verify the org/repo in the WIF provider condition |
+| `Composer environment not found` | Wrong env name or location | Check the environment exists in **Composer → Environments** |
+| `Service account key creation disabled` | Org policy blocks keys | Use WIF (already implemented here) |
 
 ---
 
@@ -427,7 +483,7 @@ This project follows modern GCP security best practices:
 - ✅ **Environment isolation** — separate SAs and resources for dev/prod
 - ✅ **Repository-scoped WIF** — only this GitHub repo can authenticate
 - ✅ **GitHub Environments** — require manual approval for prod deploys
-- ✅ **Secrets management** — no secrets committed to the repo
+- ✅ **Secrets management** — no credentials committed to the repo
 - ✅ **Compliant with `iam.disableServiceAccountKeyCreation`** org policy
 
 ---
